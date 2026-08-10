@@ -4,10 +4,9 @@ import math
 import re
 import time
 from datetime import datetime, timezone
-from html import unescape
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 import pandas as pd
@@ -26,15 +25,13 @@ ROOT = Path(__file__).resolve().parents[1]
 MARKETS_OUT_FILE = ROOT / "data" / "markets.json"
 TW_MARKET_OUT_FILE = ROOT / "data" / "tw_market.json"
 
-TWSE_MI_INDEX_URL = "https://www.twse.com.tw/exchangeReport/MI_INDEX"
-TWSE_MI_MARGN_URL = "https://www.twse.com.tw/exchangeReport/MI_MARGN"
-TPEX_HIGHLIGHT_URL = (
-    "https://www.tpex.org.tw/web/stock/aftertrading/market_highlight/highlight_result.php"
-)
+TWSE_MI_INDEX_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
+TWSE_MI_MARGN_URL = "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN"
+TPEX_HIGHLIGHT_URL = "https://www.tpex.org.tw/www/zh-tw/afterTrading/highlight"
 
 # 第一次執行時回補約 3 個月交易日。之後只補缺少的日期。
 INITIAL_BACKFILL_TRADING_DAYS = 66
-HTTP_DELAY_SECONDS = 0.18
+HTTP_DELAY_SECONDS = 0.35
 HTTP_RETRIES = 3
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -86,6 +83,8 @@ def download_market(symbol: str) -> list[dict[str, Any]]:
 def http_text(url: str, params: dict[str, str]) -> str:
     full_url = f"{url}?{urlencode(params)}"
     last_error: Exception | None = None
+    host = urlparse(url).netloc.lower()
+    referer = "https://www.tpex.org.tw/" if "tpex.org.tw" in host else "https://www.twse.com.tw/"
 
     for attempt in range(HTTP_RETRIES):
         try:
@@ -93,8 +92,10 @@ def http_text(url: str, params: dict[str, str]) -> str:
                 full_url,
                 headers={
                     "User-Agent": USER_AGENT,
-                    "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
-                    "Referer": "https://www.twse.com.tw/",
+                    "Accept": "application/json,text/plain,*/*",
+                    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.7",
+                    "Referer": referer,
+                    "Connection": "keep-alive",
                 },
             )
             with urlopen(request, timeout=30) as response:
@@ -182,62 +183,80 @@ def iter_twse_tables(payload: dict[str, Any]):
 
 
 def fetch_twse_day(date_iso: str) -> tuple[dict[str, Any], dict[str, float]]:
+    """取得上市股票市場廣度與當日收盤價。
+
+    目前 TWSE RWD MI_INDEX 的市場廣度位於 tables[7]，個股行情位於 tables[8]。
+    同時保留欄位名稱 fallback，避免欄位順序小幅調整時整批失效。
+    """
     date_compact = date_iso.replace("-", "")
     payload = http_json(
         TWSE_MI_INDEX_URL,
         {"response": "json", "date": date_compact, "type": "ALLBUT0999"},
     )
 
-    if payload.get("stat") not in {None, "OK"}:
-        raise RuntimeError(f"TWSE MI_INDEX {date_iso}: {payload.get('stat')}")
+    if payload.get("stat") != "OK":
+        raise RuntimeError(f"TWSE MI_INDEX {date_iso}: {payload.get('stat')!r}")
 
-    breadth: dict[str, Any] | None = None
+    tables = payload.get("tables")
+    if not isinstance(tables, list) or len(tables) < 9:
+        raise RuntimeError(f"TWSE MI_INDEX {date_iso}: unexpected tables layout")
+
+    # 市場廣度：上漲、下跌、持平、未成交、無比價；第三欄為「股票」。
+    breadth_rows = tables[7].get("data", []) if isinstance(tables[7], dict) else []
+    if len(breadth_rows) < 3:
+        raise RuntimeError(f"TWSE breadth rows missing for {date_iso}")
+
+    raw_counts: list[Any] = []
+    for row in breadth_rows:
+        if isinstance(row, list) and len(row) >= 3:
+            raw_counts.append(row[2])
+
+    if len(raw_counts) < 3:
+        raise RuntimeError(f"TWSE stock breadth column missing for {date_iso}")
+
+    advance, limit_up = parse_count_with_limit(raw_counts[0])
+    decline, limit_down = parse_count_with_limit(raw_counts[1])
+    unchanged, _ = parse_count_with_limit(raw_counts[2])
+    unmatched, _ = parse_count_with_limit(raw_counts[3]) if len(raw_counts) > 3 else (0, None)
+    no_comparison, _ = parse_count_with_limit(raw_counts[4]) if len(raw_counts) > 4 else (0, None)
+
+    if advance is None or decline is None:
+        raise RuntimeError(f"TWSE breadth parse failed for {date_iso}: {raw_counts[:5]!r}")
+
+    breadth = {
+        "advance": advance,
+        "limit_up": int(limit_up or 0),
+        "decline": decline,
+        "limit_down": int(limit_down or 0),
+        "unchanged": int(unchanged or 0),
+        "unmatched": int(unmatched or 0),
+        "no_comparison": int(no_comparison or 0),
+    }
+
+    quote_table = tables[8] if isinstance(tables[8], dict) else {}
+    fields = [str(item).strip() for item in quote_table.get("fields", [])]
+    rows = quote_table.get("data", [])
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError(f"TWSE close-price rows missing for {date_iso}")
+
+    try:
+        code_index = fields.index("證券代號")
+    except ValueError:
+        code_index = 0
+    try:
+        close_index = fields.index("收盤價")
+    except ValueError:
+        close_index = 8
+
     prices: dict[str, float] = {}
+    for row in rows:
+        if not isinstance(row, list) or len(row) <= max(code_index, close_index):
+            continue
+        code = str(row[code_index]).strip()
+        close = parse_number(row[close_index])
+        if code and close is not None and close > 0:
+            prices[code] = close
 
-    for table in iter_twse_tables(payload):
-        fields = [str(item).strip() for item in table.get("fields", [])]
-        rows = table.get("data", [])
-        title = str(table.get("title", ""))
-
-        if "股票" in fields and ("類型" in fields or "漲跌證券數合計" in title):
-            stock_index = fields.index("股票")
-            temp: dict[str, Any] = {}
-            for row in rows:
-                if not isinstance(row, list) or len(row) <= stock_index:
-                    continue
-                label = str(row[0]).strip()
-                count, limit = parse_count_with_limit(row[stock_index])
-                if label.startswith("上漲"):
-                    temp["advance"] = count
-                    temp["limit_up"] = limit
-                elif label.startswith("下跌"):
-                    temp["decline"] = count
-                    temp["limit_down"] = limit
-                elif label.startswith("持平"):
-                    temp["unchanged"] = count
-                elif label.startswith("未成交"):
-                    temp["unmatched"] = count
-                elif label.startswith("無比價"):
-                    temp["no_comparison"] = count
-
-            if temp.get("advance") is not None and temp.get("decline") is not None:
-                breadth = temp
-
-        code_field = next((field for field in fields if field in {"證券代號", "代號"}), None)
-        close_field = next((field for field in fields if field == "收盤價"), None)
-        if code_field and close_field:
-            code_index = fields.index(code_field)
-            close_index = fields.index(close_field)
-            for row in rows:
-                if not isinstance(row, list) or len(row) <= max(code_index, close_index):
-                    continue
-                code = str(row[code_index]).strip()
-                close = parse_number(row[close_index])
-                if code and close is not None and close > 0:
-                    prices[code] = close
-
-    if breadth is None:
-        raise RuntimeError(f"TWSE breadth not found for {date_iso}")
     if not prices:
         raise RuntimeError(f"TWSE close prices not found for {date_iso}")
 
@@ -245,131 +264,113 @@ def fetch_twse_day(date_iso: str) -> tuple[dict[str, Any], dict[str, float]]:
 
 
 def fetch_twse_margin_summary(date_iso: str) -> dict[str, float]:
+    """取得集中市場融資金額（仟元）。"""
     date_compact = date_iso.replace("-", "")
     payload = http_json(
         TWSE_MI_MARGN_URL,
         {"response": "json", "date": date_compact, "selectType": "MS"},
     )
 
-    for table in iter_twse_tables(payload):
-        fields = [str(item).strip() for item in table.get("fields", [])]
-        rows = table.get("data", [])
-        if "前日餘額" not in fields or "今日餘額" not in fields:
+    if payload.get("stat") != "OK":
+        raise RuntimeError(f"TWSE MI_MARGN summary {date_iso}: {payload.get('stat')!r}")
+
+    tables = payload.get("tables")
+    if not isinstance(tables, list) or not tables or not isinstance(tables[0], dict):
+        raise RuntimeError(f"TWSE margin summary table missing for {date_iso}")
+
+    rows = tables[0].get("data", [])
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 3:
+            continue
+        label = str(row[0]).replace(" ", "")
+        if "融資金額" not in label:
             continue
 
-        previous_index = fields.index("前日餘額")
-        today_index = fields.index("今日餘額")
-        for row in rows:
-            if not isinstance(row, list) or not row:
-                continue
-            label = str(row[0]).replace(" ", "")
-            if "融資金額" not in label:
-                continue
+        # 官方表格最後兩欄為「前日餘額 / 今日餘額」，單位：仟元。
+        previous_thousand = parse_number(row[-2])
+        today_thousand = parse_number(row[-1])
+        if previous_thousand is None or today_thousand is None:
+            continue
 
-            previous_thousand = parse_number(row[previous_index])
-            today_thousand = parse_number(row[today_index])
-            if previous_thousand is None or today_thousand is None:
-                break
-
-            return {
-                "previous_thousand_ntd": previous_thousand,
-                "today_thousand_ntd": today_thousand,
-                "balance_100m": today_thousand / 100000.0,
-                "change_100m": (today_thousand - previous_thousand) / 100000.0,
-            }
+        return {
+            "previous_thousand_ntd": previous_thousand,
+            "today_thousand_ntd": today_thousand,
+            "balance_100m": today_thousand / 100000.0,
+            "change_100m": (today_thousand - previous_thousand) / 100000.0,
+        }
 
     raise RuntimeError(f"TWSE margin summary not found for {date_iso}")
 
 
 def fetch_twse_margin_positions(date_iso: str) -> tuple[dict[str, int], int | None]:
+    """取得集中市場逐檔融資今日餘額（張）。"""
     date_compact = date_iso.replace("-", "")
     payload = http_json(
         TWSE_MI_MARGN_URL,
         {"response": "json", "date": date_compact, "selectType": "ALL"},
     )
 
-    for table in iter_twse_tables(payload):
-        fields = [str(item).strip() for item in table.get("fields", [])]
-        rows = table.get("data", [])
-        if len(fields) < 10 or "名稱" not in fields:
+    if payload.get("stat") != "OK":
+        raise RuntimeError(f"TWSE MI_MARGN positions {date_iso}: {payload.get('stat')!r}")
+
+    tables = payload.get("tables")
+    if not isinstance(tables, list) or len(tables) < 2 or not isinstance(tables[1], dict):
+        raise RuntimeError(f"TWSE margin positions table missing for {date_iso}")
+
+    rows = tables[1].get("data", [])
+    positions: dict[str, int] = {}
+    for row in rows:
+        # schema: 代號, 名稱, 融資買進, 賣出, 現償, 前日餘額, 今日餘額, ...
+        if not isinstance(row, list) or len(row) < 7:
             continue
-
-        code_index = next(
-            (index for index, field in enumerate(fields) if field in {"代號", "股票代號", "證券代號"}),
-            None,
-        )
-        today_indices = [index for index, field in enumerate(fields) if field == "今日餘額"]
-        if code_index is None or len(today_indices) < 1:
+        code = str(row[0]).strip()
+        balance = parse_number(row[6])
+        if not code or balance is None:
             continue
+        positions[code] = int(round(balance))
 
-        margin_today_index = today_indices[0]
-        positions: dict[str, int] = {}
-        total_lots: int | None = None
+    if not positions:
+        raise RuntimeError(f"TWSE margin positions not found for {date_iso}")
 
-        for row in rows:
-            if not isinstance(row, list) or len(row) <= margin_today_index:
-                continue
-
-            code = str(row[code_index]).strip()
-            name = str(row[fields.index("名稱")]).strip()
-            balance = parse_number(row[margin_today_index])
-            if balance is None:
-                continue
-
-            lots = int(round(balance))
-            if name == "合計" or code in {"", "　"}:
-                total_lots = lots
-                continue
-            if code:
-                positions[code] = lots
-
-        if positions:
-            return positions, total_lots
-
-    raise RuntimeError(f"TWSE margin positions not found for {date_iso}")
-
-
-def roc_date(date_iso: str) -> str:
-    dt = datetime.strptime(date_iso, "%Y-%m-%d")
-    return f"{dt.year - 1911:03d}/{dt.month:02d}/{dt.day:02d}"
-
-
-def strip_html_to_text(raw_html: str) -> str:
-    text = re.sub(r"<script\b[^>]*>.*?</script>", " ", raw_html, flags=re.I | re.S)
-    text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.I | re.S)
-    text = re.sub(r"<[^>]+>", " | ", text)
-    text = unescape(text)
-    text = re.sub(r"\s+", " ", text)
-    return text
-
-
-def extract_labeled_int(text: str, label: str) -> int | None:
-    match = re.search(rf"{re.escape(label)}\s*\|?\s*([0-9,]+)", text)
-    if not match:
-        return None
-    return int(match.group(1).replace(",", ""))
+    return positions, sum(positions.values())
 
 
 def fetch_tpex_breadth(date_iso: str) -> dict[str, int]:
-    raw_html = http_text(
+    """取得上櫃市場廣度。
+
+    TPEx afterTrading/highlight 回傳 tables[0].data[0]；
+    第 8~13 欄依序為上漲、漲停、下跌、跌停、平盤、未成交。
+    """
+    date_slash = date_iso.replace("-", "/")
+    payload = http_json(
         TPEX_HIGHLIGHT_URL,
-        {"l": "zh-tw", "o": "htm", "d": roc_date(date_iso)},
+        {"date": date_slash, "response": "json"},
     )
-    text = strip_html_to_text(raw_html)
 
+    if str(payload.get("stat", "")).lower() != "ok":
+        raise RuntimeError(f"TPEx highlight {date_iso}: {payload.get('stat')!r}")
+
+    tables = payload.get("tables")
+    if not isinstance(tables, list) or not tables or not isinstance(tables[0], dict):
+        raise RuntimeError(f"TPEx highlight table missing for {date_iso}")
+
+    rows = tables[0].get("data", [])
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], list) or len(rows[0]) < 13:
+        raise RuntimeError(f"TPEx highlight row layout changed for {date_iso}")
+
+    row = rows[0]
     values = {
-        "advance": extract_labeled_int(text, "上漲家數"),
-        "limit_up": extract_labeled_int(text, "漲停家數"),
-        "decline": extract_labeled_int(text, "下跌家數"),
-        "limit_down": extract_labeled_int(text, "跌停家數"),
-        "unchanged": extract_labeled_int(text, "平盤家數"),
-        "unmatched": extract_labeled_int(text, "未成交含暫停交易家數"),
+        "advance": parse_number(row[7]),
+        "limit_up": parse_number(row[8]),
+        "decline": parse_number(row[9]),
+        "limit_down": parse_number(row[10]),
+        "unchanged": parse_number(row[11]),
+        "unmatched": parse_number(row[12]),
     }
-
     if values["advance"] is None or values["decline"] is None:
-        raise RuntimeError(f"TPEx breadth not found for {date_iso}")
+        raise RuntimeError(f"TPEx breadth parse failed for {date_iso}: {row!r}")
 
-    return {key: int(value or 0) for key, value in values.items()}
+    return {key: int(round(value or 0)) for key, value in values.items()}
 
 
 def calculate_margin_maintenance(
@@ -535,20 +536,42 @@ def update_tw_market(global_payload: dict[str, Any]) -> None:
         print("TW market data is already up to date")
 
     failed_dates: list[str] = []
+    success_count = 0
     for index, date_iso in enumerate(missing_dates, start=1):
         print(f"TW market {index}/{len(missing_dates)}: {date_iso}")
         try:
             existing[date_iso] = fetch_tw_market_day(date_iso)
+            success_count += 1
+            row = existing[date_iso]
+            print(
+                "  OK "
+                f"margin={row['margin_balance_100m']:.2f}億 "
+                f"A/D={row['advance']}/{row['decline']} "
+                f"ratio={row['ad_ratio']}"
+            )
         except Exception as exc:
             failed_dates.append(date_iso)
             print(f"WARNING: TW market {date_iso} skipped: {exc}")
 
     rows = [existing[date] for date in sorted(existing)]
+    if not rows:
+        raise RuntimeError(
+            "TW market fetch produced zero rows; refusing to publish an empty tw_market.json"
+        )
+    if missing_dates and success_count == 0:
+        raise RuntimeError(
+            "All missing TW market dates failed; existing file would be stale, refusing silent success"
+        )
     payload = {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        "scope": "TWSE + TPEx stocks for breadth; TWSE listed market for margin balance/maintenance",
+        "scope": "TWSE + TPEx stock breadth; TWSE listed-market financing balance and estimated maintenance",
         "maintenance_formula": "sum(margin_balance_lots * 1000 * close) / financing_balance_ntd * 100",
         "maintenance_is_estimate": True,
+        "sources": {
+            "twse_breadth_prices": TWSE_MI_INDEX_URL,
+            "twse_margin": TWSE_MI_MARGN_URL,
+            "tpex_breadth": TPEX_HIGHLIGHT_URL,
+        },
         "data": rows,
     }
 
