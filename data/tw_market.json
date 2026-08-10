@@ -1,0 +1,1 @@
+{"generated_at":"2026-08-10 09:38 UTC","scope":"TWSE + TPEx stocks for breadth; TWSE listed market for margin balance/maintenance","maintenance_formula":"sum(margin_balance_lots * 1000 * close) / financing_balance_ntd * 100","maintenance_is_estimate":true,"data":[]}
