@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="light dark">
+    <title>台股大盤溫度計</title>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.6.0/dist/echarts.min.js"></script>
+    <style>
+        :root {
+            --bg: #0b1020;
+            --panel: #131a2b;
+            --panel-2: #182238;
+            --text: #f3f6fb;
+            --muted: #9eabc2;
+            --border: #28354f;
+            --accent: #5da9ff;
+            --positive: #ff6b6b;
+            --negative: #58d68d;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            font-family: Inter, "Noto Sans TC", "Microsoft JhengHei", sans-serif;
+            background: var(--bg);
+            color: var(--text);
+        }
+
+        .page {
+            width: min(1440px, calc(100% - 24px));
+            margin: 0 auto;
+            padding: 22px 0 40px;
+        }
+
+        .header {
+            display: flex;
+            gap: 16px;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 16px;
+        }
+
+        .title {
+            margin: 0;
+            font-size: clamp(24px, 3vw, 36px);
+            letter-spacing: 0.02em;
+        }
+
+        .subtitle {
+            margin: 8px 0 0;
+            color: var(--muted);
+            line-height: 1.6;
+        }
+
+        .status {
+            text-align: right;
+            color: var(--muted);
+            font-size: 14px;
+            white-space: nowrap;
+        }
+
+        .panel {
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 16px;
+            margin-bottom: 16px;
+        }
+
+        .toolbar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px 16px;
+            align-items: center;
+        }
+
+        .group {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center;
+        }
+
+        .group-title {
+            color: var(--muted);
+            font-size: 13px;
+            margin-right: 2px;
+        }
+
+        button {
+            border: 1px solid var(--border);
+            background: var(--panel-2);
+            color: var(--text);
+            border-radius: 10px;
+            padding: 8px 11px;
+            cursor: pointer;
+        }
+
+        button.active {
+            border-color: var(--accent);
+            background: rgba(93, 169, 255, 0.16);
+            color: #ddebff;
+        }
+
+        label.checkbox {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            cursor: pointer;
+            padding: 7px 9px;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            background: var(--panel-2);
+        }
+
+        input[type="checkbox"] {
+            accent-color: var(--accent);
+        }
+
+        .metrics {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+
+        .metric {
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 14px;
+        }
+
+        .metric .label {
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        .metric .value {
+            margin-top: 8px;
+            font-size: clamp(22px, 3vw, 32px);
+            font-weight: 700;
+        }
+
+        .metric .detail {
+            margin-top: 6px;
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        .up {
+            color: var(--positive) !important;
+        }
+
+        .down {
+            color: var(--negative) !important;
+        }
+
+        #chart {
+            width: 100%;
+            height: min(68vh, 680px);
+            min-height: 430px;
+        }
+
+        .footer-note {
+            color: var(--muted);
+            font-size: 13px;
+            line-height: 1.6;
+        }
+
+        .error {
+            color: #ffb3b3;
+        }
+
+        @media (max-width: 800px) {
+            .header {
+                display: block;
+            }
+
+            .status {
+                text-align: left;
+                margin-top: 10px;
+            }
+
+            .metrics {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+
+            #chart {
+                min-height: 360px;
+                height: 58vh;
+            }
+        }
+    </style>
+</head>
+<body>
+<div class="page">
+    <header class="header">
+        <div>
+            <h1 class="title">台股大盤溫度計</h1>
+            <p class="subtitle">全球主要現貨指數比較｜預設 3 個月｜最長 10 年｜每日更新</p>
+        </div>
+        <div class="status">
+            <div id="dataStatus">資料載入中…</div>
+            <div id="updatedAt"></div>
+        </div>
+    </header>
+
+    <section class="metrics">
+        <div class="metric">
+            <div class="label">台灣加權指數</div>
+            <div class="value" id="twiiValue">--</div>
+            <div class="detail" id="twiiChange">--</div>
+        </div>
+        <div class="metric">
+            <div class="label">目前比較區間</div>
+            <div class="value" id="rangeValue">3M</div>
+            <div class="detail">可切換至 10Y</div>
+        </div>
+        <div class="metric">
+            <div class="label">比較模式</div>
+            <div class="value" id="modeValue">報酬率</div>
+            <div class="detail">區間起點 = 100</div>
+        </div>
+        <div class="metric">
+            <div class="label">已顯示市場</div>
+            <div class="value" id="marketCount">1</div>
+            <div class="detail">最多 6 個市場</div>
+        </div>
+    </section>
+
+    <section class="panel">
+        <div class="toolbar">
+            <div class="group" id="rangeButtons">
+                <span class="group-title">週期</span>
+                <button data-range="1M">1M</button>
+                <button data-range="3M" class="active">3M</button>
+                <button data-range="6M">6M</button>
+                <button data-range="1Y">1Y</button>
+                <button data-range="3Y">3Y</button>
+                <button data-range="5Y">5Y</button>
+                <button data-range="10Y">10Y</button>
+            </div>
+
+            <div class="group" id="modeButtons">
+                <span class="group-title">模式</span>
+                <button data-mode="normalized" class="active">報酬率比較</button>
+                <button data-mode="raw">原始指數</button>
+            </div>
+        </div>
+
+        <div class="toolbar" style="margin-top: 12px;">
+            <div class="group" id="marketChecks">
+                <span class="group-title">市場</span>
+                <label class="checkbox"><input type="checkbox" value="TWII" checked disabled> 台灣加權</label>
+                <label class="checkbox"><input type="checkbox" value="N225"> 日經 225</label>
+                <label class="checkbox"><input type="checkbox" value="KOSPI"> KOSPI</label>
+                <label class="checkbox"><input type="checkbox" value="SP500"> S&amp;P 500</label>
+                <label class="checkbox"><input type="checkbox" value="NASDAQ"> Nasdaq</label>
+                <label class="checkbox"><input type="checkbox" value="SOX"> 費城半導體</label>
+            </div>
+        </div>
+    </section>
+
+    <section class="panel">
+        <div id="chart"></div>
+    </section>
+
+    <section class="panel footer-note">
+        <strong>資料說明：</strong>此初版使用 GitHub Actions 每日取得公開市場歷史資料，產生 <code>data/markets.json</code> 後由 GitHub Pages 直接讀取。沒有付費 API、沒有 Cloudflare、沒有付費 Server。Yahoo/yfinance 屬非官方公開資料管道，若未來來源失效，可以在維持零付費的前提下替換資料源。
+    </section>
+</div>
+
+<script>
+    const MARKET_META = {
+        TWII: { name: "台灣加權", symbol: "^TWII" },
+        N225: { name: "日經 225", symbol: "^N225" },
+        KOSPI: { name: "KOSPI", symbol: "^KS11" },
+        SP500: { name: "S&P 500", symbol: "^GSPC" },
+        NASDAQ: { name: "Nasdaq", symbol: "^IXIC" },
+        SOX: { name: "費城半導體", symbol: "^SOX" }
+    };
+
+    const RANGE_DAYS = {
+        "1M": 31,
+        "3M": 93,
+        "6M": 186,
+        "1Y": 366,
+        "3Y": 1096,
+        "5Y": 1827,
+        "10Y": 3653
+    };
+
+    let marketData = null;
+    let currentRange = "3M";
+    let currentMode = "normalized";
+
+    const chart = echarts.init(document.getElementById("chart"));
+
+    function numberFormat(value) {
+        return Number(value).toLocaleString("zh-TW", {
+            minimumFractionDigits: 2,
+            maximumFractionDigits: 2
+        });
+    }
+
+    function dateMinusDays(dateString, days) {
+        const d = new Date(`${dateString}T00:00:00`);
+        d.setDate(d.getDate() - days);
+        return d.toISOString().slice(0, 10);
+    }
+
+    function selectedMarkets() {
+        return Array.from(document.querySelectorAll("#marketChecks input[type=checkbox]:checked"))
+            .map(input => input.value);
+    }
+
+    function pointsInRange(points, lastDate, range) {
+        const start = dateMinusDays(lastDate, RANGE_DAYS[range]);
+        return points.filter(point => point.date >= start && point.date <= lastDate);
+    }
+
+    function normalizePoints(points) {
+        if (!points.length) {
+            return [];
+        }
+
+        const base = points[0].close;
+        return points.map(point => [point.date, (point.close / base) * 100]);
+    }
+
+    function rawPoints(points) {
+        return points.map(point => [point.date, point.close]);
+    }
+
+    function updateMetrics() {
+        const twii = marketData?.markets?.TWII?.data || [];
+        const latest = twii.at(-1);
+        const previous = twii.at(-2);
+
+        if (latest && previous) {
+            const delta = latest.close - previous.close;
+            const pct = (delta / previous.close) * 100;
+            const valueEl = document.getElementById("twiiValue");
+            const changeEl = document.getElementById("twiiChange");
+
+            valueEl.textContent = numberFormat(latest.close);
+            changeEl.textContent = `${delta >= 0 ? "+" : ""}${numberFormat(delta)}  (${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%)`;
+            changeEl.className = `detail ${delta >= 0 ? "up" : "down"}`;
+        }
+
+        document.getElementById("rangeValue").textContent = currentRange;
+        document.getElementById("modeValue").textContent = currentMode === "normalized" ? "報酬率" : "原始指數";
+        document.getElementById("marketCount").textContent = selectedMarkets().length;
+    }
+
+    function renderChart() {
+        if (!marketData?.markets) {
+            return;
+        }
+
+        const selected = selectedMarkets();
+        const lastDate = marketData.latest_date;
+        const series = [];
+
+        selected.forEach(key => {
+            const market = marketData.markets[key];
+            if (!market?.data?.length) {
+                return;
+            }
+
+            const visible = pointsInRange(market.data, lastDate, currentRange);
+            const data = currentMode === "normalized" ? normalizePoints(visible) : rawPoints(visible);
+
+            series.push({
+                name: MARKET_META[key].name,
+                type: "line",
+                data,
+                showSymbol: false,
+                smooth: false,
+                connectNulls: false,
+                emphasis: { focus: "series" },
+                lineStyle: { width: key === "TWII" ? 3 : 2 }
+            });
+        });
+
+        chart.setOption({
+            backgroundColor: "transparent",
+            animationDuration: 250,
+            tooltip: {
+                trigger: "axis",
+                axisPointer: { type: "cross" },
+                formatter: params => {
+                    const date = params?.[0]?.axisValue || "";
+                    const rows = params.map(item => {
+                        const value = Number(item.value[1]);
+                        const display = currentMode === "normalized"
+                            ? `${value.toFixed(2)} (${value - 100 >= 0 ? "+" : ""}${(value - 100).toFixed(2)}%)`
+                            : numberFormat(value);
+                        return `${item.marker}${item.seriesName}: <strong>${display}</strong>`;
+                    });
+                    return `<strong>${date}</strong><br>${rows.join("<br>")}`;
+                }
+            },
+            legend: {
+                top: 0,
+                textStyle: { color: "#cbd5e1" }
+            },
+            grid: {
+                left: 58,
+                right: 22,
+                top: 48,
+                bottom: 66
+            },
+            xAxis: {
+                type: "time",
+                boundaryGap: false,
+                axisLabel: { color: "#9eabc2" },
+                axisLine: { lineStyle: { color: "#41506b" } },
+                splitLine: { show: false }
+            },
+            yAxis: {
+                type: "value",
+                scale: true,
+                name: currentMode === "normalized" ? "起點 = 100" : "指數點數",
+                nameTextStyle: { color: "#9eabc2" },
+                axisLabel: {
+                    color: "#9eabc2",
+                    formatter: value => currentMode === "normalized" ? value.toFixed(0) : Number(value).toLocaleString("zh-TW")
+                },
+                splitLine: { lineStyle: { color: "rgba(158, 171, 194, 0.16)" } }
+            },
+            dataZoom: [
+                { type: "inside", xAxisIndex: 0 },
+                {
+                    type: "slider",
+                    xAxisIndex: 0,
+                    bottom: 10,
+                    height: 28,
+                    borderColor: "#28354f",
+                    backgroundColor: "#101827",
+                    fillerColor: "rgba(93, 169, 255, 0.18)",
+                    textStyle: { color: "#9eabc2" }
+                }
+            ],
+            series
+        }, true);
+
+        updateMetrics();
+    }
+
+    function bindControls() {
+        document.querySelectorAll("#rangeButtons button").forEach(button => {
+            button.addEventListener("click", () => {
+                currentRange = button.dataset.range;
+                document.querySelectorAll("#rangeButtons button").forEach(btn => btn.classList.toggle("active", btn === button));
+                renderChart();
+            });
+        });
+
+        document.querySelectorAll("#modeButtons button").forEach(button => {
+            button.addEventListener("click", () => {
+                currentMode = button.dataset.mode;
+                document.querySelectorAll("#modeButtons button").forEach(btn => btn.classList.toggle("active", btn === button));
+                renderChart();
+            });
+        });
+
+        document.querySelectorAll("#marketChecks input[type=checkbox]").forEach(input => {
+            input.addEventListener("change", renderChart);
+        });
+
+        window.addEventListener("resize", () => chart.resize());
+    }
+
+    async function loadData() {
+        try {
+            const response = await fetch(`./data/markets.json?v=${Date.now()}`, { cache: "no-store" });
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+
+            marketData = await response.json();
+            document.getElementById("dataStatus").textContent = `最新市場資料：${marketData.latest_date || "--"}`;
+            document.getElementById("updatedAt").textContent = `檔案更新：${marketData.generated_at || "--"}`;
+            renderChart();
+        } catch (error) {
+            document.getElementById("dataStatus").innerHTML = `<span class="error">尚未取得市場資料</span>`;
+            document.getElementById("updatedAt").textContent = "請先執行 GitHub Actions → Update market data";
+            chart.setOption({
+                title: {
+                    text: "尚未建立 data/markets.json",
+                    subtext: "部署後先到 GitHub Actions 手動執行 Update market data",
+                    left: "center",
+                    top: "middle",
+                    textStyle: { color: "#f3f6fb" },
+                    subtextStyle: { color: "#9eabc2" }
+                }
+            });
+            console.error(error);
+        }
+    }
+
+    bindControls();
+    loadData();
+</script>
+</body>
+</html>
